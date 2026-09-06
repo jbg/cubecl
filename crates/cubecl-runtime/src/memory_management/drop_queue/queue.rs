@@ -16,14 +16,12 @@ pub trait Fence: Sized {
     /// The fault the wait reveals, when the stream itself failed.
     fn wait(self) -> Result<(), ServerError>;
 
-    /// [`wait`](Self::wait), ignoring a fault.
-    ///
-    /// What the drop queue needs: it only has to know the device is done
-    /// reading the memory it is about to free, and a stream that faulted is
-    /// done either way. The fault reaches the caller through whatever it
-    /// touches next.
+    /// Wait before releasing resources. A failed wait does not prove that the
+    /// device stopped using them. Fail closed instead of treating an arbitrary
+    /// driver error as a terminal completion signal.
     fn sync(self) {
-        let _ = self.wait();
+        self.wait()
+            .expect("the fence must establish completion before releasing resources");
     }
 }
 
@@ -64,6 +62,16 @@ pub struct PendingDropQueue<E: Fence> {
     policy: FlushingPolicy,
     /// The current state of the policy.
     policy_state: FlushingPolicyState,
+}
+
+impl<E: Fence> Drop for PendingDropQueue<E> {
+    fn drop(&mut self) {
+        // Destruction can follow a failed wait, a failed fence factory, or a
+        // panic in submission. None proves that these host pointers are idle.
+        // Normal drain empties both lists; uncertain teardown quarantines them.
+        core::mem::forget(core::mem::take(&mut self.pending));
+        core::mem::forget(core::mem::take(&mut self.staged));
+    }
 }
 
 impl<E: Fence> core::fmt::Debug for PendingDropQueue<E> {
@@ -367,5 +375,34 @@ mod tests {
         queue.flush(&factory);
         queue.flush(&factory);
         queue.flush(&factory);
+    }
+
+    #[test]
+    fn failed_fence_preserves_both_batches_until_a_successful_wait() {
+        struct UncertainFence(bool);
+        impl Fence for UncertainFence {
+            fn wait(self) -> Result<(), ServerError> {
+                if self.0 {
+                    Ok(())
+                } else {
+                    Err(ServerError::SubmissionFailed {
+                        message: "wait status unknown".into(),
+                    })
+                }
+            }
+        }
+        let mut queue = PendingDropQueue::<UncertainFence>::default();
+        queue.push(sample_bytes());
+        queue.flush(|| UncertainFence(false));
+        queue.push(sample_bytes());
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.flush(|| UncertainFence(true));
+        }));
+        assert!(failed.is_err());
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(queue.staged.len(), 1);
+        queue.drain(|| UncertainFence(true));
+        assert!(queue.pending.is_empty());
+        assert!(queue.staged.is_empty());
     }
 }

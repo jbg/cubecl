@@ -2,6 +2,7 @@ use crate::device::{
     DeviceId, DeviceService, DeviceServiceStage, ServerUtilitiesHandle,
     handle::{CallError, DeviceHandleSpec, ServiceCreationError},
 };
+use alloc::string::String;
 use core::time::Duration;
 use cubecl_environment::future::channel::oneshot;
 use cubecl_environment::stream::StreamId;
@@ -64,6 +65,10 @@ impl DeviceHandleSpec for ChannelDeviceHandle {
         self.state.utilities()
     }
 
+    fn submission_error(&self) -> Option<String> {
+        self.state.service.failure.lock().clone()
+    }
+
     /// Runs `task` on the device thread, blocking until it returns.
     fn submit_blocking<'a, R: Send, T: FnOnce(&mut dyn Any) -> R + Send + 'a>(
         &self,
@@ -112,7 +117,27 @@ impl ChannelDeviceHandle {
         let current = StreamId::current();
 
         let func_init = move || {
-            state.act_on(|state| current.executes(|| task(state.as_mut())));
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                state.act_on(|state| current.executes(|| task(state.as_mut())));
+            })) {
+                // No caller is waiting for this task's result. Keep the first
+                // failure on the service, including panics before its own
+                // write scopes can attribute a failure to output buffers.
+                let error = CallError::from_panic(payload);
+                let message = error
+                    .message()
+                    .unwrap_or("asynchronous task panicked with a non-string payload");
+                let mut failure = state.failure.lock();
+                if failure.is_none() {
+                    *failure = Some(message.into());
+                }
+                log::warn!("Task failed: {error:?}");
+                drop(failure);
+                // Preserve synchronous/re-entrant propagation. The queued
+                // dispatcher still catches this payload, but cannot erase
+                // the service diagnostic recorded above.
+                error.resume();
+            }
         };
 
         self.send::<_, FLUSH>(func_init)
@@ -240,6 +265,7 @@ struct ChannelDeviceState {
 struct ChannelService {
     type_id: TypeId,
     utilities: ServerUtilitiesHandle,
+    failure: std::sync::Arc<spin::Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
@@ -387,7 +413,11 @@ impl ChannelDeviceState {
                     map.entry(type_id)
                         .or_insert_with(|| RefCell::new(Box::new(service)));
                     callback
-                        .send(Ok(ChannelService { type_id, utilities }))
+                        .send(Ok(ChannelService {
+                            type_id,
+                            utilities,
+                            failure: Default::default(),
+                        }))
                         .unwrap();
                 }
             });
@@ -1189,6 +1219,61 @@ mod tests {
             DeviceHandle::<MockService, ChannelDeviceHandle>::new,
             shutdown_device,
         )
+    }
+
+    #[test]
+    fn asynchronous_failure_is_sticky_and_shared_by_reconstructed_handles() {
+        let handle = mock_fixture();
+        handle.submit(|state| {
+            state.counter = 17;
+            panic!("first asynchronous failure");
+        });
+        // A blocking call still runs so cleanup and native fences can be
+        // issued. Its own success cannot clear an earlier submission failure.
+        assert_eq!(handle.submit_blocking(|state| state.counter).unwrap(), 17);
+        assert_eq!(
+            handle.submission_error().as_deref(),
+            Some("first asynchronous failure")
+        );
+        let reconstructed =
+            DeviceHandle::<MockService, ChannelDeviceHandle>::new(handle.device_id());
+        reconstructed.submit(|_| panic!("later asynchronous failure"));
+        reconstructed.submit_blocking(|_| ()).unwrap();
+        assert_eq!(reconstructed.submission_error(), handle.submission_error());
+        assert_eq!(
+            reconstructed.submission_error().as_deref(),
+            Some("first asynchronous failure")
+        );
+
+        struct Independent;
+        impl DeviceService for Independent {
+            fn init(_: DeviceId) -> Self {
+                Self
+            }
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+        }
+        let independent = DeviceHandle::<Independent, ChannelDeviceHandle>::new(handle.device_id());
+        independent.submit_blocking(|_| ()).unwrap();
+        assert!(independent.submission_error().is_none());
+    }
+
+    #[test]
+    fn large_asynchronous_failure_is_not_lost_by_the_task_arena() {
+        let handle = mock_fixture();
+        let payload = [7u8; 8192];
+        handle.submit(move |state| {
+            state.counter = core::hint::black_box(payload)[8000] as usize;
+            std::panic::panic_any(123u32);
+        });
+        assert_eq!(handle.submit_blocking(|state| state.counter).unwrap(), 7);
+        assert!(
+            handle
+                .submission_error()
+                .unwrap()
+                .contains("non-string payload")
+        );
     }
 
     #[test]

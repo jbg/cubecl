@@ -282,9 +282,30 @@ impl Client {
             return Box::pin(core::future::ready(Err(err)));
         }
         let stream_id = self.stream_id();
-        self.device
-            .submit_blocking(move |server| server.read(descriptors, stream_id))
-            .unwrap_or_resume()
+        let held = crate::memory_management::retention::CompletionRetention::new((
+            self.device.clone(),
+            descriptors
+                .iter()
+                .map(|desc| desc.handle.clone())
+                .collect::<Vec<_>>(),
+        ));
+        let device = self.device.clone();
+        let result = self.device.submit_blocking(move |server| {
+            if let Some(message) = device.submission_error() {
+                return Box::pin(core::future::ready(Err(ServerError::SubmissionFailed {
+                    message,
+                }))) as DynFut<Result<Vec<Bytes>, ServerError>>;
+            }
+            server.read(descriptors, stream_id)
+        });
+        Box::pin(async move {
+            let future = result.map_err(|error| ServerError::SubmissionFailed {
+                message: format!("{error:?}"),
+            })?;
+            let bytes = future.await?;
+            drop(held.release());
+            Ok(bytes)
+        })
     }
 
     /// Given bindings, returns owned resources as bytes.
@@ -442,8 +463,12 @@ impl Client {
             });
         }
 
+        let device = self.device.clone();
         self.device
             .submit_blocking(move |server| {
+                if let Some(message) = device.submission_error() {
+                    return Err(ServerError::SubmissionFailed { message });
+                }
                 let server = (server as &mut dyn Any)
                     .downcast_mut::<S>()
                     .expect("is_service passed, so this is the server's type");
@@ -1199,18 +1224,30 @@ impl Client {
     ) -> Result<(), ServerError> {
         let bindings = self.bindings(handles)?;
         let stream_id = self.stream_id();
-        self.device
+        let result = self
+            .device
             .submit_blocking(move |server| server.check(bindings, stream_id))
-            .unwrap_or_resume()
+            .unwrap_or_resume();
+        self.submission_status()?;
+        result
     }
 
     /// Flush all outstanding commands.
     pub fn flush(&self) -> Result<(), ServerError> {
         let stream_id = self.stream_id();
-
-        self.device
+        let result = self
+            .device
             .submit_blocking(move |server| server.flush(stream_id))
-            .unwrap_or_resume()
+            .unwrap_or_resume();
+        result?;
+        self.submission_status()
+    }
+
+    fn submission_status(&self) -> Result<(), ServerError> {
+        match self.device.submission_error() {
+            Some(message) => Err(ServerError::SubmissionFailed { message }),
+            None => Ok(()),
+        }
     }
 
     /// Prepare this client's stream for a graph capture (see
@@ -1266,8 +1303,8 @@ impl Client {
 
     /// Wait for the completion of every task in the server.
     ///
-    /// The barrier alone, which also reports a device fault — the only failure
-    /// left that no buffer can report. A launch failure is not this sync's to
+    /// The barrier alone, which also reports a device fault or an unhandled
+    /// asynchronous submission panic. A launch failure is not this sync's to
     /// report: it lives on the buffers the launch never wrote and surfaces on
     /// any read, [`check`](Self::check) or
     /// [`sync_buffers`](Self::sync_buffers) of those.
@@ -1284,8 +1321,11 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// The device fault the barrier found, or [`ServerError::Several`] naming
-    /// every failure these buffers carry.
+    /// The device fault the barrier found, [`ServerError::SubmissionFailed`]
+    /// for an unhandled asynchronous panic, or [`ServerError::Several`] naming
+    /// every failure these buffers carry. Resources are released only after
+    /// the native barrier succeeds. Cancellation or an unsuccessful barrier
+    /// conservatively retains the bindings and service, potentially indefinitely.
     pub fn sync_buffers<'a>(
         &self,
         handles: impl IntoIterator<Item = &'a Handle>,
@@ -1296,14 +1336,35 @@ impl Client {
             Err(err) => return Box::pin(core::future::ready(Err(err))),
         };
 
-        let fut = self
-            .device
-            .submit_blocking(move |server| server.sync(bindings, stream_id))
-            .unwrap_or_resume();
+        // Keep both the allocations and their owning service alive even when
+        // the returned future is cancelled, unwinds, or cannot prove completion.
+        let held = crate::memory_management::retention::CompletionRetention::new((
+            self.device.clone(),
+            bindings.clone(),
+        ));
+        let device = self.device.clone();
+        let result = self.device.submit_blocking(move |server| {
+            // A buffer check may fail immediately. Always obtain the actual
+            // native barrier first; that failure must not replace a fence.
+            let future = server.sync(Vec::new(), stream_id);
+            let checked = server.check(bindings, stream_id);
+            (future, checked, device.submission_error())
+        });
 
         self.utilities.logger.profile_summary();
 
-        fut
+        Box::pin(async move {
+            let (future, checked, failure) =
+                result.map_err(|error| ServerError::SubmissionFailed {
+                    message: format!("{error:?}"),
+                })?;
+            future.await?;
+            drop(held.release());
+            if let Some(message) = failure {
+                return Err(ServerError::SubmissionFailed { message });
+            }
+            checked
+        })
     }
 
     /// The bindings `handles` name, which is what crosses to the device

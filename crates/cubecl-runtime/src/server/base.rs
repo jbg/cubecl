@@ -297,6 +297,13 @@ impl core::fmt::Debug for ResourceLimitError {
 #[derive(Error, Clone)]
 #[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
 pub enum ServerError {
+    /// A panic escaped asynchronous submission before its failure could be
+    /// reliably attributed to buffers. Sticky for this service's lifetime.
+    #[error("An asynchronous service submission failed: {message}")]
+    SubmissionFailed {
+        /// The first panic recorded by the service transport.
+        message: String,
+    },
     /// A runtime validation error
     #[error(
         "A validation error happened during execution\nCaused by:\n  {message}\nBacktrace:\n{backtrace}"

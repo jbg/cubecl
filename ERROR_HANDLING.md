@@ -1,8 +1,25 @@
 # Error handling
 
-A failure belongs to the memory that work left unwritten, and travels the
-dataflow from there. Nothing else holds error state — no queue, no per-stream
-error list, no device-wide flag.
+A failure attributed to a launch belongs to the memory that work left unwritten,
+and travels the dataflow from there. A panic escaping asynchronous service
+submission has no reliable write set; the transport retains its first diagnostic
+for that service's lifetime. All handles to the same registration see it. Other
+services on the device remain independent.
+
+`DeviceHandle::submission_error` is a status snapshot, not a completion fence.
+Blocking service calls still run, allowing native barriers and cleanup to be
+issued after a failure. `Client::flush`, buffer checks, reads and synchronization
+report the sticky submission failure. There is no reset that could make
+partially written buffers silently trustworthy again.
+
+`Client::sync_buffers` always obtains the native barrier independently of the
+buffer check, then waits before reporting a buffer or submission error. A failed
+native wait still does not establish completion. Submitted resources and their
+owning service are retained if a completion future is cancelled, unwinds or
+returns without a successful native fence. This conservative quarantine can
+leak memory on those paths; it never authorizes early pool reuse. Deferred host
+drop queues likewise retain their batches across failed waits and quarantine
+undrained bytes on destruction.
 
 ## The model
 
@@ -129,8 +146,8 @@ allocation are two claims, not one.
 
 ## What is deliberately absent
 
-**No queue.** A failure is not owed to a later flush. It is on the buffers, and
-a read of one of them is the report.
+**No queue of attributed launch failures.** Those failures live on buffers.
+Unhandled transport panics are the service-wide exception described above.
 
 **No per-stream error state, with one exception.** A stream is not an edge, so
 anything scoped to one breaks the isolation above. Metal keeps the exception:

@@ -119,6 +119,12 @@ impl<S: ?Sized + 'static, I: DeviceHandleSpec> DeviceHandle<S, I> {
         self.handle.flush_queue();
     }
 
+    /// The first unhandled asynchronous panic on this service. Observing it
+    /// never clears it. This snapshot does not establish device completion.
+    pub fn submission_error(&self) -> Option<alloc::string::String> {
+        self.handle.submission_error()
+    }
+
     pub fn exclusive<R: Send, T: FnOnce() -> R + Send>(&self, task: T) -> Result<R, CallError> {
         self.handle.exclusive(task)
     }

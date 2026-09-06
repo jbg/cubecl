@@ -2,6 +2,7 @@ pub(crate) mod memory_pool;
 
 mod base;
 mod error_graph;
+pub(crate) mod retention;
 mod taint;
 
 /// Export utilities to keep track of CPU buffers when performing async data copies.

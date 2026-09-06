@@ -148,6 +148,15 @@ pub trait DeviceHandleSpec: Sized + Clone {
     /// This is a no-op for blocking handles.
     fn flush_queue(&self);
 
+    /// The first panic that escaped an asynchronous service call, if any.
+    ///
+    /// This is sticky for the service lifetime and shared by reconstructed
+    /// handles. It is a status snapshot, not a host or device completion fence.
+    /// Blocking transports propagate panics directly and have no hidden failure.
+    fn submission_error(&self) -> Option<String> {
+        None
+    }
+
     fn submit_blocking<'a, R: Send, T: FnOnce(&mut dyn Any) -> R + Send + 'a>(
         &self,
         task: T,

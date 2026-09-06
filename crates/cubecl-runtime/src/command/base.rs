@@ -13,6 +13,7 @@
 use super::{CopyLayout, DeviceResource, DeviceStream, Driver, Staging};
 use crate::id::KernelId;
 use crate::memory_management::drop_queue::Fence;
+use crate::memory_management::retention::CompletionRetention;
 use crate::memory_management::{
     InstallMemoryPoolsError, ManagedMemoryHandle, MemoryAllocationMode, MemoryConfiguration,
     MemoryHandle, MemoryReport, MemoryUsage,
@@ -257,27 +258,26 @@ impl<'a, D: Driver> Command<'a, D> {
             .iter()
             .map(|descriptor| descriptor.handle.clone())
             .collect::<Vec<_>>();
-        let result = self.copies_to_bytes(descriptors);
+        let held = CompletionRetention::new(held);
+        let result = CompletionRetention::new(self.copies_to_bytes(descriptors));
         let fence = D::Stream::fence(self.streams.current().signal());
 
         async move {
-            let synced = fence.wait();
+            fence.wait()?;
             // The bindings kept the source allocations alive across the copies;
             // the fence above is what says they are done being read.
-            core::mem::drop(held);
-
-            synced?;
-            result.map_err(Into::into)
+            core::mem::drop(held.release());
+            result.release().map_err(Into::into)
         }
     }
 
     /// Copy each descriptor's device memory into a fresh host buffer.
     fn copies_to_bytes(&mut self, descriptors: Vec<CopyDescriptor>) -> Result<Vec<Bytes>, IoError> {
-        let mut result = Vec::with_capacity(descriptors.len());
+        let mut result = CompletionRetention::new(Vec::with_capacity(descriptors.len()));
 
         for descriptor in descriptors {
             match self.copy_to_bytes(descriptor, None) {
-                Ok(bytes) => result.push(bytes),
+                Ok(bytes) => result.get_mut().push(bytes),
                 Err(err) => {
                     // The buffers collected so far are the destinations of
                     // copies already enqueued: dropping them hands their
@@ -286,15 +286,16 @@ impl<'a, D: Driver> Command<'a, D> {
                     // them. The fence `read_async` records to cover exactly
                     // this does not exist yet on the error path, so record
                     // one here and wait it out before the partial set drops.
-                    if !result.is_empty() {
+                    if !result.get_mut().is_empty() {
                         D::Stream::fence(self.streams.current().signal()).sync();
                     }
+                    drop(result.release());
                     return Err(err);
                 }
             }
         }
 
-        Ok(result)
+        Ok(result.release())
     }
 
     /// Copy one descriptor's device memory into a fresh host buffer.
@@ -304,10 +305,10 @@ impl<'a, D: Driver> Command<'a, D> {
         stream_id: Option<StreamId>,
     ) -> Result<Bytes, IoError> {
         let num_bytes = descriptor.shape.iter().product::<usize>() * descriptor.elem_size;
-        let mut bytes = self.reserve_cpu(num_bytes, stream_id);
-        self.write_to_cpu(descriptor, &mut bytes, stream_id)?;
+        let mut bytes = CompletionRetention::new(self.reserve_cpu(num_bytes, stream_id));
+        self.write_to_cpu(descriptor, bytes.get_mut(), stream_id)?;
 
-        Ok(bytes)
+        Ok(bytes.release())
     }
 
     /// Enqueue a copy of `descriptor`'s device memory into `bytes`.
@@ -396,11 +397,13 @@ impl<'a, D: Driver> Command<'a, D> {
         };
 
         let current = self.streams.current();
+        let mut data = CompletionRetention::new(data);
 
         // SAFETY: `resource` is a live device allocation, `data` is a valid
         // host buffer, and either the drop queue or the capture window below
         // keeps it alive for as long as the device reads it.
-        unsafe { D::copy_to_device(&resource, &layout, &data, current)? };
+        unsafe { D::copy_to_device(&resource, &layout, data.get_mut(), current)? };
+        let data = data.release();
 
         if current.capturing().is_recording() {
             // A copy recorded into a graph is not executed now but re-read on
