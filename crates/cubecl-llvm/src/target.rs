@@ -11,6 +11,7 @@ use pliron::context::Context;
 pub enum LlvmTarget {
     #[default]
     Cpu,
+    #[cfg(feature = "amdgpu")]
     AmdGpu,
 }
 
@@ -36,8 +37,11 @@ mod tests {
     fn the_context_carries_the_target() {
         let mut ctx = Context::default();
 
-        ctx.set_target(LlvmTarget::AmdGpu);
-        assert_eq!(ctx.target(), LlvmTarget::AmdGpu);
+        #[cfg(feature = "amdgpu")]
+        {
+            ctx.set_target(LlvmTarget::AmdGpu);
+            assert_eq!(ctx.target(), LlvmTarget::AmdGpu);
+        }
 
         ctx.set_target(LlvmTarget::Cpu);
         assert_eq!(ctx.target(), LlvmTarget::Cpu);

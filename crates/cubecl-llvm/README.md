@@ -13,7 +13,15 @@ for:
 Either one arrives as a `PlironArtifact`, which a runtime calls into.
 
 LLVM is vendored through `tracel-llvm-bundler` by this crate's `build.rs`, so
-there is no system LLVM to install.
+there is no system LLVM to install. CPU-only builds require only the host target
+(for example, AArch64 on Apple silicon).
+
+The optional `amdgpu` feature enables the AMDGPU target, its public types and
+compilation options, and the native shims and LLD libraries used to emit code
+objects. `cubecl-hip` enables it automatically; `cubecl-cpu` does not. Enabling
+this feature requires an LLVM bundle with the AMDGPU target in addition to the
+host target. Cargo unifies features, so applications enabling both runtimes also
+need both LLVM targets.
 
 ## Layout
 
@@ -30,7 +38,7 @@ there is no system LLVM to install.
 
 The AMDGPU target reaches three parts of LLVM that have no C API: LLD's ELF
 driver, the bitcode linker's `--only-needed` mode, and the AMDGPU `printf`
-emitter. `build.rs` compiles `amdgpu/cpp_shims/` alongside the crate to wrap
+emitter. With the `amdgpu` feature, `build.rs` compiles `amdgpu/cpp_shims/` alongside the crate to wrap
 them.
 
 ## Debugging the compiler
